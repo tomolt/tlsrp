@@ -8,31 +8,23 @@
 .Nm
 .Fl u Ar backpath
 .Fl U Ar frontpath
-.Fl a Ar ca_path
-.Fl r Ar cert_path
-.Fl k Ar key_path
+.Ar ca-file , cert-file , key-file .
 .Nm
 .Fl u Ar backpath
 .Fl P Ar frontport
 .Oo Fl H Ar fronthost Oc
-.Fl a Ar ca_path
-.Fl r Ar cert_path
-.Fl k Ar key_path
+.Ar ca-file , cert-file , key-file .
 .Nm
 .Fl p Ar backport
 .Oo Fl h Ar backhost Oc
 .Fl U Ar frontpath
-.Fl a Ar ca_path
-.Fl r Ar cert_path
-.Fl k Ar key_path
+.Ar ca-file , cert-file , key-file .
 .Nm
 .Fl p Ar backport
 .Oo Fl h Ar backhost Oc
 .Fl P Ar frontport
 .Oo Fl P Ar fronthost Oc
-.Fl a Ar ca_path
-.Fl r Ar cert_path
-.Fl k Ar key_path
+.Ar ca-file , cert-file , key-file .
 
 .Sh DESCRIPTION
 .Nm
@@ -40,9 +32,6 @@ is a simple TLS reverse-proxy. It can be used to serve any TCP/IP protocol over 
 
 .Sh OPTIONS
 .Bl -tag -width Ds
-.It Fl a Ar ca_path
-.Ar ca_path
-is the file to use as the CA certificate.
 
 .It Fl h Ar backhost
 .Ar backhost
@@ -51,20 +40,12 @@ is the hostname that the backend server is listening on. If not set explicitly, 
 .Ar fronthost
 is the hostname to listen on. If not set explicitly, this will default to the address of the loopback interface.
 
-.It Fl k Ar key_path
-.Ar key_path
-is the file to use as the private key.
-
 .It Fl p Ar backport
 .Ar backport
 is the port that the backend server is listening on.
 .It Fl P Ar frontport
 .Ar frontport
 is the port to listen on.
-
-.It Fl r Ar cert_path
-.Ar key_path
-is the file to use as the TLS certificate.
 
 .It Fl u Ar backpath
 .Ar backpath

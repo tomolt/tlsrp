@@ -27,7 +27,9 @@ char *argv0;
 static void
 usage(void)
 {
-	fprintf(stderr, "usage: %s [-u backpath | -p backport [-h backhost]] [-U frontpath | -P frontport [-H fronthost]] -a ca_path -r cert_path -k key_path\n", argv0);
+	fprintf(stderr, "usage: %s [-u backpath | -p backport [-h backhost]]"
+	                " [-U frontpath | -P frontport [-H fronthost]]"
+	                " ca-file cert-file key-file\n", argv0);
 }
 
 static int
@@ -165,18 +167,18 @@ main(int argc, char **argv)
 	     *fronthost = NULL,
 	     *backport  = NULL,
 	     *frontport = NULL,
-	     *capath    = NULL,
-	     *certpath  = NULL,
-	     *keypath   = NULL;
+	     *cafile    = NULL,
+	     *certfile  = NULL,
+	     *keyfile   = NULL;
 
 	ARGBEGIN {
-	case 'a': capath    = EARGF(usage()); break;
+	case 'a': cafile    = EARGF(usage()); break;
 	case 'h': backhost  = EARGF(usage()); break;
 	case 'H': fronthost = EARGF(usage()); break;
-	case 'k': keypath   = EARGF(usage()); break;
+	case 'k': keyfile   = EARGF(usage()); break;
 	case 'p': backport  = EARGF(usage()); break;
 	case 'P': frontport = EARGF(usage()); break;
-	case 'r': certpath  = EARGF(usage()); break;
+	case 'r': certfile  = EARGF(usage()); break;
 	case 'u': backpath  = EARGF(usage()); break;
 	case 'U': frontpath = EARGF(usage()); break;
 	case 'v':
@@ -191,15 +193,19 @@ main(int argc, char **argv)
 		usage();
 		exit(1);
 	} ARGEND
+	if (argc != 3) {
+		usage();
+		exit(1);
+	}
+	cafile   = *argv++;
+	certfile = *argv++;
+	keyfile  = *argv++;
 
 	if ((backpath && backhost) || !(backpath || backport))
 		die("can only serve on unix socket xor network socket");
 
 	if ((frontpath && fronthost) || !(frontpath || frontport))
 		die("can only receive on unix socket xor network socket");
-
-	if (!capath || !certpath || !keypath)
-		die("must provide ca_path, cert_path and key_path");
 
 	if (!(config = tls_config_new()))
 		tcdie(config, "failed to get tls config:");
@@ -212,11 +218,11 @@ main(int argc, char **argv)
 		tcdie(config, "failed to set dheparams:");
 	if (tls_config_set_ecdhecurves(config, ecdhecurves) < 0)
 		tcdie(config, "failed to set ecdhecurves:");
-	if (tls_config_set_ca_file(config, capath) < 0)
+	if (tls_config_set_ca_file(config, cafile) < 0)
 		tcdie(config, "failed to load ca file:");
-	if (tls_config_set_cert_file(config, certpath) < 0)
+	if (tls_config_set_cert_file(config, certfile) < 0)
 		tcdie(config, "failed to load cert file:");
-	if (tls_config_set_key_file(config, keypath) < 0)
+	if (tls_config_set_key_file(config, keyfile) < 0)
 		tcdie(config, "failed to load key file:");
 
 	if (!(toclient = tls_server()))
@@ -232,10 +238,8 @@ main(int argc, char **argv)
 	else
 		bindfd = networksocket(fronthost, frontport, bind);
 
-	if (listen(bindfd, BACKLOG) < 0) {
-		close(bindfd);
-		die("could not start listen:");
-	}
+	if (listen(bindfd, BACKLOG) < 0)
+		die("cannot listen on socket:");
 
 	while (1) {
 		if ((clientfd = accept(bindfd, (struct sockaddr *)&client_sa, 
