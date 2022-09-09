@@ -18,6 +18,8 @@
 #define SERVER 0
 #define CLIENT 1
 
+typedef int (*attach_func)(int, const struct sockaddr *, socklen_t);
+
 char *argv0;
 
 static void
@@ -28,7 +30,7 @@ usage(void)
 }
 
 static int
-donetworkbind(const char *host, const char *port)
+networksocket(const char *host, const char *port, attach_func attach)
 {
     int sfd = -1;
     struct addrinfo *results = NULL, *rp = NULL;
@@ -45,21 +47,21 @@ donetworkbind(const char *host, const char *port)
         if (sfd == -1)
             continue;
 
-        if (bind(sfd, rp->ai_addr, rp->ai_addrlen) == 0)
+        if (attach(sfd, rp->ai_addr, rp->ai_addrlen) == 0)
             break;
 
         close(sfd);
     }
     
     if (rp == NULL)
-        die("failed to bind:");
+        die("failed to create network socket:");
 
     free(results);
     return sfd;
 }
 
 static int
-dounixbind(const char *path)
+unixsocket(const char *path, attach_func attach)
 {
     struct sockaddr_un saddr = { .sun_family = AF_UNIX };
     int sfd;
@@ -68,63 +70,11 @@ dounixbind(const char *path)
         die("unix socket path too long:");
 
     if ((sfd = socket(AF_UNIX, SOCK_STREAM, 0)) == -1)
-        die("failed to create unix-domain socket at %s:", path);
+        die("failed to create unix socket at %s:", path);
 
-    if (bind(sfd, (struct sockaddr*)&saddr, sizeof(struct sockaddr_un)) == -1)
-        die("failed to bind to socket at %s:", path);
+    if (attach(sfd, (struct sockaddr*)&saddr, sizeof(struct sockaddr_un)) == -1)
+        die("failed to attach to unix socket at %s:", path);
 
-    return sfd;
-}
-
-static int
-dounixconnect(const char *sockname)
-{
-    int sfd;
-    struct sockaddr_un saddr = {0};
-
-    if (!memccpy(saddr.sun_path, sockname, '\0', sizeof(saddr.sun_path)))
-        die("unix socket path too long");
-
-    saddr.sun_family = AF_UNIX;
-
-    if ((sfd = socket(AF_UNIX, SOCK_STREAM, 0)) == -1)
-        die("failed to create unix socket:");
-
-    if (connect(sfd, (struct sockaddr*)&saddr, sizeof(struct sockaddr_un)) == -1) {
-        close(sfd);
-        die("failed to connect to unix socket:");
-    }
-
-    return sfd;
-}
-
-static int
-donetworkconnect(const char* host, const char* port)
-{
-    int sfd = -1;
-    struct addrinfo *results = NULL, *rp = NULL;
-    struct addrinfo hints = { .ai_family = AF_UNSPEC,
-                              .ai_socktype = SOCK_STREAM};
-
-    if (getaddrinfo(host, port, &hints, &results) != 0)
-        die("getaddrinfo failed:");
-
-    for (rp = results; rp != NULL; rp = rp->ai_next) {
-        sfd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
-
-        if (sfd == -1)
-            continue;
-
-        if (connect(sfd, rp->ai_addr, rp->ai_addrlen) == 0)
-            break;
-
-        close(sfd);
-    }
-    
-    if (rp == NULL)
-        warn("failed to connect:");
-
-    free(results);
     return sfd;
 }
 
@@ -306,9 +256,9 @@ main(int argc, char* argv[])
     tls_config_free(config);
 
     if (frontpath)
-        bindfd = dounixbind(frontpath);
+        bindfd = unixsocket(frontpath, bind);
     else
-        bindfd = donetworkbind(fronthost, frontport);
+        bindfd = networksocket(fronthost, frontport, bind);
 
 
     if (listen(bindfd, BACKLOG) == -1) {
@@ -328,9 +278,9 @@ main(int argc, char* argv[])
         switch ((pid = fork())) {
             case 0:
                 if (backpath)
-                    serverfd = dounixconnect(backpath);
+                    serverfd = unixsocket(backpath, connect);
                 else
-                    serverfd = donetworkconnect(backhost, backport);
+                    serverfd = networksocket(backhost, backport, connect);
 
                 if (tls_accept_socket(toclient, &conn, clientfd) == -1) {
                     warn("tls_accept_socket: %s", tls_error(toclient));
