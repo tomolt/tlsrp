@@ -172,13 +172,10 @@ main(int argc, char **argv)
 	     *keyfile   = NULL;
 
 	ARGBEGIN {
-	case 'a': cafile    = EARGF(usage()); break;
 	case 'h': backhost  = EARGF(usage()); break;
 	case 'H': fronthost = EARGF(usage()); break;
-	case 'k': keyfile   = EARGF(usage()); break;
 	case 'p': backport  = EARGF(usage()); break;
 	case 'P': frontport = EARGF(usage()); break;
-	case 'r': certfile  = EARGF(usage()); break;
 	case 'u': backpath  = EARGF(usage()); break;
 	case 'U': frontpath = EARGF(usage()); break;
 	case 'v':
