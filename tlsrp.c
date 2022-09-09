@@ -33,7 +33,7 @@ usage(void)
 static int
 networksocket(const char *host, const char *port, attach_func attach)
 {
-	int sfd = -1;
+	int fd = -1;
 	struct addrinfo *results = NULL, *rp = NULL;
 	struct addrinfo hints = { .ai_family = AF_UNSPEC,
 		.ai_socktype = SOCK_STREAM};
@@ -42,41 +42,37 @@ networksocket(const char *host, const char *port, attach_func attach)
 	if ((err = getaddrinfo(host, port, &hints, &results)) != 0)
 		die("dobind: getaddrinfo: %s", gai_strerror(err));
 
-	for (rp = results; rp != NULL; rp = rp->ai_next) {
-		sfd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
+	for (rp = results; rp; rp = rp->ai_next) {
+		fd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
+		if (fd < 0) continue;
 
-		if (sfd == -1)
-			continue;
+		if (attach(fd, rp->ai_addr, rp->ai_addrlen) == 0) break;
 
-		if (attach(sfd, rp->ai_addr, rp->ai_addrlen) == 0)
-			break;
-
-		close(sfd);
+		close(fd);
 	}
 
-	if (rp == NULL)
-		die("failed to create network socket:");
+	if (!rp) die("failed to create network socket:");
 
 	free(results);
-	return sfd;
+	return fd;
 }
 
 static int
 unixsocket(const char *path, attach_func attach)
 {
-	struct sockaddr_un saddr = { .sun_family = AF_UNIX };
-	int sfd;
+	struct sockaddr_un addr = { .sun_family = AF_UNIX };
+	int fd;
 
-	if (!memccpy(saddr.sun_path, path, '\0', sizeof(saddr.sun_path)))
+	if (!memccpy(addr.sun_path, path, '\0', sizeof addr.sun_path))
 		die("unix socket path too long:");
 
-	if ((sfd = socket(AF_UNIX, SOCK_STREAM, 0)) == -1)
+	if ((fd = socket(AF_UNIX, SOCK_STREAM, 0)) < 0)
 		die("failed to create unix socket at %s:", path);
 
-	if (attach(sfd, (struct sockaddr*)&saddr, sizeof(struct sockaddr_un)) == -1)
+	if (attach(fd, (struct sockaddr*)&addr, sizeof(struct sockaddr_un)) < 0)
 		die("failed to attach to unix socket at %s:", path);
 
-	return sfd;
+	return fd;
 }
 
 static int
@@ -259,7 +255,6 @@ main(int argc, char* argv[])
 	else
 		bindfd = networksocket(fronthost, frontport, bind);
 
-
 	if (listen(bindfd, BACKLOG) == -1) {
 		close(bindfd);
 		die("could not start listen:");
@@ -295,8 +290,10 @@ tlsfail:
 			close(clientfd);
 			close(bindfd);
 			exit(0);
+			break;
 		case -1:
 			warn("fork:");
+			/* fallthrough */
 		default:
 			close(clientfd);
 		}
