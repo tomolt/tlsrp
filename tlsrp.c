@@ -13,6 +13,7 @@
 
 #include "util.h"
 #include "config.h"
+#include "arg.h"
 
 #define BACKLOG 10
 #define TIMEOUT 1000
@@ -27,7 +28,6 @@ static void
 usage(void)
 {
     fprintf(stderr, "usage: %s [-u backpath | -p backport [-h backhost]] [-U frontpath | -P frontport [-H fronthost]] -a ca_path -r cert_path -k key_path\n", argv0);
-	exit(1);
 }
 
 static int
@@ -172,48 +172,47 @@ main(int argc, char* argv[])
          *cert_path = NULL,
          *key_path = NULL;
     int opt;
-    char *optstring = "a:h:H:k:p:P:r:u:U:v";
 
-    argv0 = argv[0];
-
-    while ((opt = getopt(argc, argv, optstring)) != -1) {
-        switch (opt) {
-            case 'a':
-                ca_path = optarg;
-                break;
-            case 'h':
-                backhost = optarg;
-                break;
-            case 'H':
-                fronthost = optarg;
-                break;
-            case 'k':
-                key_path = optarg;
-                break;
-            case 'p':
-                backport = optarg;
-                break;
-            case 'P':
-                frontport = optarg;
-                break;
-            case 'r':
-                cert_path = optarg;
-                break;
-            case 'u':
-                backpath = optarg;
-                break;
-            case 'U':
-                frontpath = optarg;
-                break;
-            case 'v':
-                printf("%s " VERSION "\n", argv0);
-                exit(0);
-                break;
-            case '?':
-            default:
-                usage();
-        }
-    }
+    ARGBEGIN {
+    case 'a':
+	ca_path = EARGF(usage());
+	break;
+    case 'h':
+	backhost = EARGF(usage());
+	break;
+    case 'H':
+	fronthost = EARGF(usage());
+	break;
+    case 'k':
+	key_path = EARGF(usage());
+	break;
+    case 'p':
+	backport = EARGF(usage());
+	break;
+    case 'P':
+	frontport = EARGF(usage());
+	break;
+    case 'r':
+	cert_path = EARGF(usage());
+	break;
+    case 'u':
+	backpath = EARGF(usage());
+	break;
+    case 'U':
+	frontpath = EARGF(usage());
+	break;
+    case 'v':
+	printf("%s " VERSION "\n", argv0);
+	exit(0);
+	break;
+    case '?':
+	usage();
+	exit(0);
+	break;
+    default:
+	usage();
+	exit(1);
+    } ARGEND
 
     if ((backpath && backhost) || !(backpath || backport))
         die("can only serve on unix socket xor network socket");
