@@ -31,12 +31,12 @@ verr(const char *fmt, va_list ap)
 static void
 tls_conf_err(struct tls_config *config, const char *fmt, va_list ap)
 {
-    const char* errstring = tls_config_error(config);
+	const char* errstring = tls_config_error(config);
 	vfprintf(stderr, fmt, ap);
 
 	if (fmt[0] && fmt[strlen(fmt) - 1] == ':') {
 		fputc(' ', stderr);
-        fputs(errstring, stderr);
+		fputs(errstring, stderr);
 	} else {
 		fputc('\n', stderr);
 	}
@@ -45,12 +45,12 @@ tls_conf_err(struct tls_config *config, const char *fmt, va_list ap)
 static void
 tls_err(struct tls *ctx, const char *fmt, va_list ap)
 {
-    const char* errstring = tls_error(ctx);
+	const char* errstring = tls_error(ctx);
 	vfprintf(stderr, fmt, ap);
 
 	if (fmt[0] && fmt[strlen(fmt) - 1] == ':') {
 		fputc(' ', stderr);
-        fputs(errstring, stderr);
+		fputs(errstring, stderr);
 	} else {
 		fputc('\n', stderr);
 	}
