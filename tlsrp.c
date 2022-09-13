@@ -59,17 +59,24 @@ static int
 moreconns(void)
 {
 	void *mem;
-	capconns = capconns ? 2 * capconns : 16;
+	size_t newcap = capconns ? 2 * capconns : 16;
+	
 	/* TODO reallocarray() */
-	mem = realloc(conns,
-		capconns * sizeof *conns +
-		(1+2*capconns) * sizeof *pfds);
+	mem = realloc(conns, newcap * sizeof *conns);
 	if (!mem) {
 		warn("insufficient memory");
 		return -1;
 	}
 	conns = mem;
-	pfds = (void *)&conns[capconns];
+
+	mem = realloc(pfds, (1+2*newcap) * sizeof *pfds);
+	if (!mem) {
+		warn("insufficient memory");
+		return -1;
+	}
+	pfds = mem;
+
+	capconns = newcap;
 	return 0;
 }
 
@@ -275,7 +282,7 @@ svout(struct conn *conn, int fd)
 		ssize_t ret = write(fd,
 			conn->cl2sv.data,
 			conn->cl2sv.length);
-		if (ret > 0) {
+		if (ret >= 0) {
 			conn->cl2sv.length -= ret;
 			memmove(conn->cl2sv.data, conn->cl2sv.data + ret,
 				conn->cl2sv.length);
@@ -318,8 +325,8 @@ serve(size_t id)
 		return -1;
 
 	svp->events = (conn->sv2cl.length < BUFSIZ/2 ? POLLIN : 0) |
-		(conn->cl2sv.length < BUFSIZ/2 ? 0 : POLLOUT);
-	clp->events = (conn->sv2cl.length < BUFSIZ/2 ? 0 : conn->cloutevt) |
+		(conn->cl2sv.length > 0 ? POLLOUT : 0);
+	clp->events = (conn->sv2cl.length > 0 ? conn->cloutevt : 0) |
 		(conn->cl2sv.length < BUFSIZ/2 ? conn->clinevt : 0);
 
 	return 0;
@@ -410,7 +417,7 @@ main(int argc, char **argv)
 		die("cannot listen on socket:");
 
 	for (;;) {
-		status = poll(pfds, numconns, -1);
+		status = poll(pfds, 1+2*numconns, -1);
 		if (!status) continue;
 		if (status < 0) {
 			if (errno == EINTR) continue;

@@ -3,9 +3,8 @@ VERSION = "0.3 (Oltmann variant)"
 # flags
 CC = cc
 CFLAGS = -std=c99 -Wall -Wextra
-
-# glibc
 CPPFLAGS = -DVERSION=\"$(VERSION)\" -D_XOPEN_SOURCE=700
+LDFLAGS =
 
 # paths
 PREFIX = /usr/local
@@ -18,4 +17,4 @@ MANPREFIX = $(PREFIX)/share/man
 # FLAGS = `PKG_CONFIG_PATH=$(LIBTLS_PKGCONF_PATH) pkg-config --libs libtls`
 
 # Any system that is using LibreSSL as the default SSL provider
-FLAGS = -ltls
+LDLIBS = -ltls

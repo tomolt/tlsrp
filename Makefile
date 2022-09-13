@@ -12,7 +12,7 @@ config.h:
 	$(CC) $(CFLAGS) $(CPPFLAGS) -c $<
 
 tlsrp: $(OBJ) config.h
-	$(CC) $(FLAGS) $(OBJ) -o $@
+	$(CC) $(LDFLAGS) $(OBJ) -o $@ $(LDLIBS)
 
 certs:
 	cd CA ; ./certgen.sh
