@@ -426,8 +426,8 @@ main(int argc, char **argv)
 		size_t id;
 		for (id = 0; status; id++) {
 			int active = 0;
-			if (SVPFD(id).events) status--, active = 1;
-			if (CLPFD(id).events) status--, active = 1;
+			if (SVPFD(id).revents) status--, active = 1;
+			if (CLPFD(id).revents) status--, active = 1;
 			if (active) {
 				if (serve(id) < 0) {
 					delconn(id);
