@@ -2,6 +2,7 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 
+#include <errno.h>
 #include <netdb.h>
 #include <poll.h>
 #include <stdio.h>
@@ -16,20 +17,94 @@
 #include "arg.h"
 
 #define BACKLOG 10
-#define TIMEOUT 1000
-#define SERVER 0
-#define CLIENT 1
+
+/* get lvalue of the pollfd for the server of the connection with index id */
+#define SVPFD(id) (pfds[2*(id)+1])
+/* get lvalue of the pollfd for the client of the connection with index id */
+#define CLPFD(id) (pfds[2*(id)+2])
 
 typedef int (*attach_func)(int, const struct sockaddr *, socklen_t);
 
-char *argv0;
+struct buffer {
+	size_t length;
+	char  *data;
+};
+
+struct conn {
+	struct buffer sv2cl;
+	struct buffer cl2sv;
+	struct tls *tls;
+	int clinevt;
+	int cloutevt;
+};
+
+char          *argv0;
+struct conn   *conns;
+struct pollfd *pfds;
+size_t         numconns;
+size_t         capconns;
+
+static int
+moreconns(void)
+{
+	void *mem;
+	capconns = capconns ? 2 * capconns : 16;
+	/* TODO reallocarray() */
+	mem = realloc(conns,
+		capconns * sizeof *conns +
+		(1 + capconns) * sizeof *pfds);
+	if (!mem) {
+		warn("insufficient memory");
+		return -1;
+	}
+	conns = mem;
+	pfds = (void *)&conns[capconns];
+	return 0;
+}
+
+static int
+addconn(size_t *idptr)
+{
+	size_t id;
+	void *mem;
+
+	if (numconns + 1 > capconns) {
+		if (moreconns() < 0) return -1;
+	}
+
+	if (!(mem = malloc(2 * BUFSIZ))) {
+		warn("insufficient memory");
+		return -1;
+	}
+
+	id = numconns++;
+
+	conns[id].sv2cl.length = 0;
+	conns[id].sv2cl.data = mem;
+	conns[id].cl2sv.length = 0;
+	conns[id].cl2sv.data = (char *)mem + BUFSIZ;
+	conns[id].tls = NULL;
+	conns[id].clinevt = POLLIN;
+	conns[id].cloutevt = POLLOUT;
+
+	*idptr = id;
+	return 0;
+}
 
 static void
-usage(void)
+delconn(size_t id)
 {
-	fprintf(stderr, "usage: %s [-u backpath | -p backport [-h backhost]]"
-	                " [-U frontpath | -P frontport [-H fronthost]]"
-	                " ca-file cert-file key-file\n", argv0);
+	/* sv2cl & cl2sv are allocated as one block, so only free() the first one! */
+	free(conns[id].sv2cl.data);
+	tls_close(conns[id].tls);
+	tls_free(conns[id].tls);
+	close(SVPFD(id).fd);
+	close(CLPFD(id).fd);
+
+	--numconns;
+	conns[id] = conns[numconns];
+	SVPFD(id) = SVPFD(numconns);
+	CLPFD(id) = CLPFD(numconns);
 }
 
 static int
@@ -38,7 +113,7 @@ networksocket(const char *host, const char *port, attach_func attach)
 	int fd = -1;
 	struct addrinfo *results = NULL, *rp = NULL;
 	struct addrinfo hints = { .ai_family = AF_UNSPEC,
-		.ai_socktype = SOCK_STREAM};
+		.ai_socktype = SOCK_STREAM };
 
 	int err;
 	if ((err = getaddrinfo(host, port, &hints, &results)) != 0)
@@ -78,98 +153,198 @@ unixsocket(const char *path, attach_func attach)
 }
 
 static int
-serve(int serverfd, int clientfd, struct tls *clientconn)
+establishconn(int bindfd, struct tls *bindtls, const char *backpath, const char *backhost, const char *backport)
 {
-	struct pollfd pfd[] = {
-		{ serverfd, POLLIN | POLLOUT, 0 },
-		{ clientfd, POLLIN | POLLOUT, 0 }
-	};
+	struct sockaddr_storage client_sa = { 0 };
+	socklen_t client_sa_len = 0;
+	size_t id;
+	int clfd, svfd;
+	struct tls *tls;
 
-	char clibuf[BUFSIZ] = { 0 };
-	char serbuf[BUFSIZ] = { 0 };
-
-	char *cliptr = NULL, *serptr = NULL;
-
-	ssize_t clicount = 0, sercount = 0;
-	ssize_t written = 0;
-
-	while (poll(pfd, 2, TIMEOUT) != 0) {
-		if ((pfd[CLIENT].revents | pfd[SERVER].revents) & POLLNVAL)
-			return -1;
-
-		if ((pfd[CLIENT].revents & POLLIN) && clicount == 0) {
-			clicount = tls_read(clientconn, clibuf, BUFSIZ);
-			if (clicount < 0) {
-				tdie(clientconn, "client read failed:");
-				return -2;
-			} else if (clicount == TLS_WANT_POLLIN) {
-				pfd[CLIENT].events = POLLIN;
-			} else if (clicount == TLS_WANT_POLLOUT) {
-				pfd[CLIENT].events = POLLOUT;
-			} else {
-				cliptr = clibuf;
-			}
-		}
-
-		if ((pfd[SERVER].revents & POLLIN) && sercount == 0) {
-			sercount = read(serverfd, serbuf, BUFSIZ);
-			if (sercount < 0) {
-				die("server read failed:");
-				return -3;
-			}
-			serptr = serbuf;
-		}
-
-		if ((pfd[SERVER].revents & POLLOUT) && clicount > 0) {
-			written = write(serverfd, cliptr, clicount);
-			if (written < 0)
-				die("failed to write:");
-			clicount -= written;
-			cliptr += written;
-		}
-
-		if ((pfd[CLIENT].revents & POLLOUT) && sercount > 0) {
-			written = tls_write(clientconn, serptr, sercount);
-			if (written < 0)
-				tdie(clientconn, "failed tls_write:");
-			else if (written == TLS_WANT_POLLIN) {
-				pfd[CLIENT].events = POLLIN;
-			} else if (written == TLS_WANT_POLLOUT) {
-				pfd[CLIENT].events = POLLOUT;
-			} else {
-				sercount -= written;
-				serptr += written;
-			}
-		}
-
-		if ((pfd[CLIENT].revents | pfd[SERVER].revents) & POLLHUP)
-			if (clicount == 0 && sercount == 0)
-				break;
-
-		if ((pfd[CLIENT].revents | pfd[SERVER].revents) & POLLERR)
-			break;
+	clfd = accept(bindfd,
+		(struct sockaddr *)&client_sa,
+		&client_sa_len);
+	if (clfd < 0) {
+		return -1;
 	}
+
+	if (tls_accept_socket(bindtls, &tls, clfd) < 0) {
+		warn("tls_accept_socket(): %s", tls_error(bindtls));
+		close(clfd);
+		return -1;
+	}
+
+	svfd = backpath ? unixsocket(backpath, connect) :
+		networksocket(backhost, backport, connect);
+	if (svfd < 0) {
+		tls_close(tls);
+		tls_free(tls);
+		close(clfd);
+		return -1;
+	}
+
+	if (addconn(&id) < 0) {
+		tls_close(tls);
+		tls_free(tls);
+		close(clfd);
+		close(svfd);
+		return -1;
+	}
+
+	conns[id].tls = tls;
+	SVPFD(id).fd = svfd;
+	CLPFD(id).fd = clfd;
+
 	return 0;
+}
+
+static int
+clin(struct conn *conn)
+{
+	ssize_t ret = tls_read(conn->tls,
+		conn->cl2sv.data + conn->cl2sv.length,
+		BUFSIZ - conn->cl2sv.length);
+	switch (ret) {
+	case -1:
+		warn("tls_read(): %s", tls_error(conn->tls));
+		return -1;
+	case TLS_WANT_POLLIN:
+		conn->clinevt = POLLIN;
+		return 0;
+	case TLS_WANT_POLLOUT:
+		conn->clinevt = POLLOUT;
+		return 0;
+	default:
+		conn->cl2sv.length += ret;
+		conn->clinevt = POLLIN;
+		return 0;
+	}
+}
+
+static int
+clout(struct conn *conn)
+{
+	ssize_t ret = tls_write(conn->tls, conn->sv2cl.data, conn->sv2cl.length);
+	switch (ret) {
+	case -1:
+		warn("tls_write(): %s", tls_error(conn->tls));
+		return -1;
+	case TLS_WANT_POLLIN:
+		conn->cloutevt = POLLIN;
+		return 0;
+	case TLS_WANT_POLLOUT:
+		conn->cloutevt = POLLOUT;
+		return 0;
+	default:
+		conn->sv2cl.length -= ret;
+		memmove(conn->sv2cl.data, conn->sv2cl.data + ret,
+			conn->sv2cl.length);
+		conn->cloutevt = POLLOUT;
+		return 0;
+	}
+}
+
+static int
+svin(struct conn *conn, int fd)
+{
+	for (;;) {
+		ssize_t ret = read(fd,
+			conn->sv2cl.data + conn->sv2cl.length,
+			BUFSIZ - conn->sv2cl.length);
+		if (ret > 0) {
+			conn->sv2cl.length += ret;
+			return 0;
+		}
+		if (!ret) {
+			return -1;
+		}
+		if (errno != EINTR) {
+			if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
+			warn("read():");
+			return -1;
+		}
+	}
+}
+
+static int
+svout(struct conn *conn, int fd)
+{
+	for (;;) {
+		ssize_t ret = write(fd,
+			conn->cl2sv.data,
+			conn->cl2sv.length);
+		if (ret > 0) {
+			conn->cl2sv.length -= ret;
+			memmove(conn->cl2sv.data, conn->cl2sv.data + ret,
+				conn->cl2sv.length);
+			return 0;
+		}
+		if (errno != EINTR) {
+			if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
+			warn("write():");
+			return -1;
+		}
+	}
+}
+
+static int
+serve(size_t id)
+{
+	struct conn *conn = &conns[id];
+	struct pollfd *clp = &CLPFD(id), *svp = &SVPFD(id);
+
+	if ((clp->revents | svp->revents) & POLLNVAL)
+		return -1;
+
+	if (clp->revents & conn->clinevt) {
+		if (clin(conn) < 0) return -1;
+	}
+	if (svp->revents & POLLIN) {
+		if (svin(conn, svp->fd) < 0) return -1;
+	}
+	if (clp->revents & conn->cloutevt) {
+		if (clout(conn) < 0) return -1;
+	}
+	if (svp->revents & POLLOUT) {
+		if (svout(conn, svp->fd) < 0) return -1;
+	}
+
+	if ((clp->revents | svp->revents) & POLLHUP)
+		if (!conn->sv2cl.length && !conn->cl2sv.length)
+			return -1;
+	if ((clp->revents | svp->revents) & POLLERR)
+		return -1;
+
+	svp->events = (conn->sv2cl.length < BUFSIZ/2 ? POLLIN : 0) |
+		(conn->cl2sv.length < BUFSIZ/2 ? 0 : POLLOUT);
+	clp->events = (conn->sv2cl.length < BUFSIZ/2 ? 0 : conn->cloutevt) |
+		(conn->cl2sv.length < BUFSIZ/2 ? conn->clinevt : 0);
+
+	return 0;
+}
+
+static void
+usage(void)
+{
+	fprintf(stderr, "usage: %s [-u backpath | -p backport [-h backhost]]"
+	                " [-U frontpath | -P frontport [-H fronthost]]"
+	                " ca-file cert-file key-file\n", argv0);
 }
 
 int 
 main(int argc, char **argv)
 {
-	int serverfd = 0, clientfd = 0, bindfd = 0;
-	struct sockaddr_storage client_sa = { 0 };
+	int bindfd = 0;
 	struct tls_config *config;
-	struct tls *toclient, *conn;
-	socklen_t client_sa_len = 0;
-	pid_t pid;
+	struct tls *bindtls;
+	int status;
+	char *cafile, *certfile, *keyfile;
 	char *backpath  = NULL,
 	     *frontpath = NULL,
 	     *backhost  = NULL,
 	     *fronthost = NULL,
 	     *backport  = NULL,
-	     *frontport = NULL,
-	     *cafile    = NULL,
-	     *certfile  = NULL,
-	     *keyfile   = NULL;
+	     *frontport = NULL;
 
 	ARGBEGIN {
 	case 'h': backhost  = EARGF(usage()); break;
@@ -200,7 +375,6 @@ main(int argc, char **argv)
 
 	if ((backpath && backhost) || !(backpath || backport))
 		die("can only serve on unix socket xor network socket");
-
 	if ((frontpath && fronthost) || !(frontpath || frontport))
 		die("can only receive on unix socket xor network socket");
 
@@ -222,53 +396,49 @@ main(int argc, char **argv)
 	if (tls_config_set_key_file(config, keyfile) < 0)
 		tcdie(config, "failed to load key file:");
 
-	if (!(toclient = tls_server()))
+	if (!(bindtls = tls_server()))
 		die("failed to create server context");
 
-	if ((tls_configure(toclient, config)) < 0)
-		tdie(toclient, "failed to configure server:");
+	if ((tls_configure(bindtls, config)) < 0)
+		tdie(bindtls, "failed to configure server:");
 
 	tls_config_free(config);
 
-	if (frontpath)
-		bindfd = unixsocket(frontpath, bind);
-	else
-		bindfd = networksocket(fronthost, frontport, bind);
+	bindfd = frontpath ? unixsocket(frontpath, bind) :
+		networksocket(fronthost, frontport, bind);
+
+	pfds = calloc(1, sizeof *pfds);
+	pfds[0].fd = bindfd;
+	pfds[0].events = POLLIN;
 
 	if (listen(bindfd, BACKLOG) < 0)
 		die("cannot listen on socket:");
 
-	while (1) {
-		if ((clientfd = accept(bindfd, (struct sockaddr *)&client_sa, 
-						&client_sa_len)) < 0) {
-			warn("could not accept connection:");
+	for (;;) {
+		status = poll(pfds, numconns, -1);
+		if (!status) continue;
+		if (status < 0) {
+			if (errno == EINTR) continue;
+			warn("poll():");
 			continue;
 		}
 
-		switch ((pid = fork())) {
-		case 0:
-			if (backpath)
-				serverfd = unixsocket(backpath, connect);
-			else
-				serverfd = networksocket(backhost, backport, connect);
+		if (pfds[0].revents) {
+			status--;
+			establishconn(bindfd, bindtls, backpath, backhost, backport);
+		}
 
-			if (tls_accept_socket(toclient, &conn, clientfd) < 0) {
-				warn("tls_accept_socket: %s", tls_error(toclient));
-			} else {
-				if (serverfd)
-					serve(serverfd, clientfd, conn);
-				tls_close(conn);
+		size_t id;
+		for (id = 0; status; id++) {
+			int active = 0;
+			if (SVPFD(id).events) status--, active = 1;
+			if (CLPFD(id).events) status--, active = 1;
+			if (active) {
+				if (serve(id) < 0) {
+					delconn(id);
+					id--;
+				}
 			}
-			close(serverfd);
-			close(clientfd);
-			close(bindfd);
-			exit(0);
-			break;
-		case -1:
-			warn("fork:");
-			/* fallthrough */
-		default:
-			close(clientfd);
 		}
 	}
 }

@@ -1,7 +1,7 @@
 tlsrp
 =====
 
-tlsrp is a simple TLS reverse-proxy built on top of LibreSSL's libtls.
+tlsrp is a simple and efficient TLS reverse-proxy built on top of LibreSSL's libtls.
 
       ┌────────┐   Protocol   ┌───────┐   Protocol/TLS   ┌────────┐
       │ Server │ <==========> │ tlsrp │ <==============> │ Client │
