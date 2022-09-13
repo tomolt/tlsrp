@@ -5,6 +5,7 @@
 #include <errno.h>
 #include <netdb.h>
 #include <poll.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -54,6 +55,8 @@ struct conn   *conns;
 struct pollfd *pfds;
 size_t         numconns;
 size_t         capconns;
+
+volatile int interrupted;
 
 static int
 moreconns(void)
@@ -155,7 +158,7 @@ networksocket(const char *host, const char *port, attach_func attach)
 
 	if (!rp) die("failed to create network socket:");
 
-	free(results);
+	freeaddrinfo(results);
 	return fd;
 }
 
@@ -333,6 +336,16 @@ serve(size_t id)
 }
 
 static void
+handle_signal(int signal)
+{
+	switch (signal) {
+	case SIGINT:
+		interrupted = 1;
+		break;
+	}
+}
+
+static void
 usage(void)
 {
 	fprintf(stderr, "usage: %s [-u backpath | -p backport [-h backhost]]"
@@ -343,10 +356,16 @@ usage(void)
 int 
 main(int argc, char **argv)
 {
+	struct sigaction action = { 0 };
 	int bindfd = 0;
 	struct tls_config *config;
 	struct tls *bindtls;
 	int status;
+
+	action.sa_handler = handle_signal;
+	sigaction(SIGINT, &action, NULL);
+	action.sa_handler = SIG_IGN;
+	sigaction(SIGPIPE, &action, NULL);
 
 	ARGBEGIN {
 	case 'h': backhost  = EARGF(usage()); break;
@@ -416,7 +435,7 @@ main(int argc, char **argv)
 	if (listen(bindfd, BACKLOG) < 0)
 		die("cannot listen on socket:");
 
-	for (;;) {
+	while (!interrupted) {
 		status = poll(pfds, 1+2*numconns, -1);
 		if (!status) continue;
 		if (status < 0) {
@@ -443,5 +462,17 @@ main(int argc, char **argv)
 			}
 		}
 	}
+
+	fprintf(stderr, "Received interrupt. Exiting ...\n");
+
+	size_t id;
+	for (id = 0; id < numconns; id++) {
+		delconn(id);
+	}
+	free(conns);
+	free(pfds);
+	tls_close(bindtls);
+	tls_free(bindtls);
+	close(bindfd);
 }
 

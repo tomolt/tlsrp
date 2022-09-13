@@ -1,4 +1,4 @@
-VERSION = "0.3 (Oltmann variant)"
+VERSION = "0.4 (Oltmann variant)"
 
 # flags
 CC = cc
