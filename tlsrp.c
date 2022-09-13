@@ -27,6 +27,8 @@ typedef int (*attach_func)(int, const struct sockaddr *, socklen_t);
 struct buffer {
 	size_t length;
 	char  *data;
+	int    fin;
+	int    finack;
 };
 
 struct conn {
@@ -100,18 +102,16 @@ addconn(size_t *idptr)
 
 	id = numconns++;
 
-	conns[id].sv2cl.length = 0;
+	memset(&conns[id], 0, sizeof *conns);
 	conns[id].sv2cl.data = mem;
-	conns[id].cl2sv.length = 0;
 	conns[id].cl2sv.data = (char *)mem + BUFSIZ;
-	conns[id].tls = NULL;
 	conns[id].clinevt = POLLIN;
 	conns[id].cloutevt = POLLOUT;
 
 	SVPFD(id).fd = -1;
-	SVPFD(id).events = POLLIN | POLLOUT;
+	SVPFD(id).events = POLLIN;
 	CLPFD(id).fd = -1;
-	CLPFD(id).events = POLLIN | POLLOUT;
+	CLPFD(id).events = POLLIN;
 
 	*idptr = id;
 	return 0;
@@ -213,6 +213,10 @@ fail:
 static int
 clin(struct conn *conn)
 {
+	if (BUFSIZ - conn->cl2sv.length <= 0) {
+		fprintf(stderr, "Uh oh, attempted zero-length TLS read\n");
+		return 0;
+	}
 	ssize_t ret = tls_read(conn->tls,
 		conn->cl2sv.data + conn->cl2sv.length,
 		BUFSIZ - conn->cl2sv.length);
@@ -226,6 +230,9 @@ clin(struct conn *conn)
 	case TLS_WANT_POLLOUT:
 		conn->clinevt = POLLOUT;
 		return 0;
+	case 0:
+		conn->cl2sv.fin = 1;
+		return 0;
 	default:
 		conn->cl2sv.length += ret;
 		conn->clinevt = POLLIN;
@@ -236,6 +243,10 @@ clin(struct conn *conn)
 static int
 clout(struct conn *conn)
 {
+	if (conn->sv2cl.length <= 0) {
+		fprintf(stderr, "Uh oh, attempted zero-length TLS write\n");
+		return 0;
+	}
 	ssize_t ret = tls_write(conn->tls, conn->sv2cl.data, conn->sv2cl.length);
 	switch (ret) {
 	case -1:
@@ -246,6 +257,9 @@ clout(struct conn *conn)
 		return 0;
 	case TLS_WANT_POLLOUT:
 		conn->cloutevt = POLLOUT;
+		return 0;
+	case 0:
+		conn->cl2sv.fin = 1;
 		return 0;
 	default:
 		conn->sv2cl.length -= ret;
@@ -259,6 +273,10 @@ clout(struct conn *conn)
 static int
 svin(struct conn *conn, int fd)
 {
+	if (BUFSIZ - conn->sv2cl.length <= 0) {
+		fprintf(stderr, "Uh oh, attempted zero-length FD read\n");
+		return 0;
+	}
 	for (;;) {
 		ssize_t ret = read(fd,
 			conn->sv2cl.data + conn->sv2cl.length,
@@ -268,6 +286,7 @@ svin(struct conn *conn, int fd)
 			return 0;
 		}
 		if (!ret) {
+			conn->sv2cl.fin = 1;
 			return 0;
 		}
 		if (errno != EINTR) {
@@ -281,11 +300,15 @@ svin(struct conn *conn, int fd)
 static int
 svout(struct conn *conn, int fd)
 {
+	if (conn->cl2sv.length <= 0) {
+		fprintf(stderr, "Uh oh, attempted zero-length FD write\n");
+		return 0;
+	}
 	for (;;) {
 		ssize_t ret = write(fd,
 			conn->cl2sv.data,
 			conn->cl2sv.length);
-		if (ret >= 0) {
+		if (ret > 0) {
 			conn->cl2sv.length -= ret;
 			memmove(conn->cl2sv.data, conn->cl2sv.data + ret,
 				conn->cl2sv.length);
@@ -326,6 +349,18 @@ serve(size_t id)
 			return -1;
 	if ((clp->revents | svp->revents) & POLLERR)
 		return -1;
+
+	if (conn->cl2sv.fin && !conn->cl2sv.length) {
+		shutdown(SVPFD(id).fd, SHUT_WR);
+		conn->cl2sv.fin = 0;
+		conn->cl2sv.finack = 1;
+	}
+	if (conn->sv2cl.fin && !conn->sv2cl.length) {
+		shutdown(CLPFD(id).fd, SHUT_WR);
+		conn->cl2sv.fin = 0;
+		conn->cl2sv.finack = 1;
+	}
+	if (conn->sv2cl.finack && conn->cl2sv.finack) return -1;
 
 	svp->events = (conn->sv2cl.length < BUFSIZ/2 ? POLLIN : 0) |
 		(conn->cl2sv.length > 0 ? POLLOUT : 0);
