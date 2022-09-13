@@ -1,3 +1,5 @@
+#define BACKLOG 10
+
 /* check libtls documentation for possible values */
 
 int protocols = TLS_PROTOCOLS_DEFAULT;

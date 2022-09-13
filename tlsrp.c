@@ -16,8 +16,6 @@
 #include "config.h"
 #include "arg.h"
 
-#define BACKLOG 10
-
 /* get lvalue of the pollfd for the server of the connection with index id */
 #define SVPFD(id) (pfds[2*(id)+1])
 /* get lvalue of the pollfd for the client of the connection with index id */
@@ -38,7 +36,20 @@ struct conn {
 	int cloutevt;
 };
 
-char          *argv0;
+char *argv0;
+
+char *cafile;
+char *certfile;
+char *keyfile;
+
+char *backpath;
+char *backhost;
+char *backport;
+
+char *frontpath;
+char *fronthost;
+char *frontport;
+
 struct conn   *conns;
 struct pollfd *pfds;
 size_t         numconns;
@@ -52,7 +63,7 @@ moreconns(void)
 	/* TODO reallocarray() */
 	mem = realloc(conns,
 		capconns * sizeof *conns +
-		(1 + capconns) * sizeof *pfds);
+		(1+2*capconns) * sizeof *pfds);
 	if (!mem) {
 		warn("insufficient memory");
 		return -1;
@@ -87,6 +98,11 @@ addconn(size_t *idptr)
 	conns[id].clinevt = POLLIN;
 	conns[id].cloutevt = POLLOUT;
 
+	SVPFD(id).fd = -1;
+	SVPFD(id).events = POLLIN | POLLOUT;
+	CLPFD(id).fd = -1;
+	CLPFD(id).events = POLLIN | POLLOUT;
+
 	*idptr = id;
 	return 0;
 }
@@ -96,10 +112,12 @@ delconn(size_t id)
 {
 	/* sv2cl & cl2sv are allocated as one block, so only free() the first one! */
 	free(conns[id].sv2cl.data);
-	tls_close(conns[id].tls);
-	tls_free(conns[id].tls);
-	close(SVPFD(id).fd);
-	close(CLPFD(id).fd);
+	if (conns[id].tls) {
+		tls_close(conns[id].tls);
+		tls_free(conns[id].tls);
+	}
+	if (SVPFD(id).fd >= 0) close(SVPFD(id).fd);
+	if (CLPFD(id).fd >= 0) close(CLPFD(id).fd);
 
 	--numconns;
 	conns[id] = conns[numconns];
@@ -153,49 +171,33 @@ unixsocket(const char *path, attach_func attach)
 }
 
 static int
-establishconn(int bindfd, struct tls *bindtls, const char *backpath, const char *backhost, const char *backport)
+establishconn(int bindfd, struct tls *bindtls)
 {
 	struct sockaddr_storage client_sa = { 0 };
 	socklen_t client_sa_len = 0;
 	size_t id;
-	int clfd, svfd;
-	struct tls *tls;
 
-	clfd = accept(bindfd,
+	if (addconn(&id) < 0) return -1;
+
+	CLPFD(id).fd = accept(bindfd,
 		(struct sockaddr *)&client_sa,
 		&client_sa_len);
-	if (clfd < 0) {
-		return -1;
-	}
+	if (CLPFD(id).fd < 0) goto fail;
 
-	if (tls_accept_socket(bindtls, &tls, clfd) < 0) {
+	if (tls_accept_socket(bindtls, &conns[id].tls, CLPFD(id).fd) < 0) {
 		warn("tls_accept_socket(): %s", tls_error(bindtls));
-		close(clfd);
-		return -1;
+		goto fail;
 	}
 
-	svfd = backpath ? unixsocket(backpath, connect) :
+	SVPFD(id).fd = backpath ? unixsocket(backpath, connect) :
 		networksocket(backhost, backport, connect);
-	if (svfd < 0) {
-		tls_close(tls);
-		tls_free(tls);
-		close(clfd);
-		return -1;
-	}
-
-	if (addconn(&id) < 0) {
-		tls_close(tls);
-		tls_free(tls);
-		close(clfd);
-		close(svfd);
-		return -1;
-	}
-
-	conns[id].tls = tls;
-	SVPFD(id).fd = svfd;
-	CLPFD(id).fd = clfd;
+	if (SVPFD(id).fd < 0) goto fail;
 
 	return 0;
+
+fail:
+	delconn(id);
+	return -1;
 }
 
 static int
@@ -256,7 +258,7 @@ svin(struct conn *conn, int fd)
 			return 0;
 		}
 		if (!ret) {
-			return -1;
+			return 0;
 		}
 		if (errno != EINTR) {
 			if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
@@ -338,13 +340,6 @@ main(int argc, char **argv)
 	struct tls_config *config;
 	struct tls *bindtls;
 	int status;
-	char *cafile, *certfile, *keyfile;
-	char *backpath  = NULL,
-	     *frontpath = NULL,
-	     *backhost  = NULL,
-	     *fronthost = NULL,
-	     *backport  = NULL,
-	     *frontport = NULL;
 
 	ARGBEGIN {
 	case 'h': backhost  = EARGF(usage()); break;
@@ -425,7 +420,7 @@ main(int argc, char **argv)
 
 		if (pfds[0].revents) {
 			status--;
-			establishconn(bindfd, bindtls, backpath, backhost, backport);
+			establishconn(bindfd, bindtls);
 		}
 
 		size_t id;
