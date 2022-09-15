@@ -462,7 +462,7 @@ main(int argc, char **argv)
 			cmd = serve(id, conns[id^1].data, &conns[id^1].length);
 			chooseevents(id, conns[id^1].length);
 			chooseevents(id^1, conns[id].length);
-			if (cmd & FIN) {
+			if ((cmd & FIN) && !conns[id^1].tls) {
 				shutdown(pfds[1+(id^1)].fd, SHUT_WR);
 			}
 			if (cmd & RESET) {
