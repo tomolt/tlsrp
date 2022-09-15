@@ -53,6 +53,7 @@ int            numconns;
 int            capconns;
 
 volatile int interrupted;
+volatile int reconfplease;
 
 static int
 moreconns(void)
@@ -328,6 +329,9 @@ handlesignal(int signal)
 	case SIGINT:
 		interrupted = 1;
 		break;
+	case SIGHUP:
+		reconfplease = 1;
+		break;
 	}
 }
 
@@ -339,18 +343,47 @@ usage(void)
 	                " ca-file cert-file key-file\n", argv0);
 }
 
+static void
+reconfigure(struct tls *bindtls)
+{
+	struct tls_config *config;
+
+	if (!(config = tls_config_new()))
+		tcdie(config, "failed to get tls config:");
+
+	if (tls_config_set_protocols(config, protocols) < 0)
+		tcdie(config, "failed to set protocols:");
+	if (tls_config_set_ciphers(config, ciphers) < 0)
+		tcdie(config, "failed to set ciphers:");
+	if (tls_config_set_dheparams(config, dheparams) < 0)
+		tcdie(config, "failed to set dheparams:");
+	if (tls_config_set_ecdhecurves(config, ecdhecurves) < 0)
+		tcdie(config, "failed to set ecdhecurves:");
+	if (tls_config_set_ca_file(config, cafile) < 0)
+		tcdie(config, "failed to load ca file:");
+	if (tls_config_set_cert_file(config, certfile) < 0)
+		tcdie(config, "failed to load cert file:");
+	if (tls_config_set_key_file(config, keyfile) < 0)
+		tcdie(config, "failed to load key file:");
+
+	if ((tls_configure(bindtls, config)) < 0)
+		tdie(bindtls, "failed to configure server:");
+
+	tls_config_free(config);
+}
+
 int 
 main(int argc, char **argv)
 {
 	struct sigaction action = { 0 };
 	int bindfd = 0;
-	struct tls_config *config;
 	struct tls *bindtls;
 	int status, cmd;
 	int id;
 
 	action.sa_handler = handlesignal;
 	sigaction(SIGINT, &action, NULL);
+	sigaction(SIGHUP, &action, NULL);
 	action.sa_handler = SIG_IGN;
 	sigaction(SIGPIPE, &action, NULL);
 
@@ -386,31 +419,9 @@ main(int argc, char **argv)
 	if ((frontpath && fronthost) || !(frontpath || frontport))
 		die("can only receive on unix socket xor network socket");
 
-	if (!(config = tls_config_new()))
-		tcdie(config, "failed to get tls config:");
-
-	if (tls_config_set_protocols(config, protocols) < 0)
-		tcdie(config, "failed to set protocols:");
-	if (tls_config_set_ciphers(config, ciphers) < 0)
-		tcdie(config, "failed to set ciphers:");
-	if (tls_config_set_dheparams(config, dheparams) < 0)
-		tcdie(config, "failed to set dheparams:");
-	if (tls_config_set_ecdhecurves(config, ecdhecurves) < 0)
-		tcdie(config, "failed to set ecdhecurves:");
-	if (tls_config_set_ca_file(config, cafile) < 0)
-		tcdie(config, "failed to load ca file:");
-	if (tls_config_set_cert_file(config, certfile) < 0)
-		tcdie(config, "failed to load cert file:");
-	if (tls_config_set_key_file(config, keyfile) < 0)
-		tcdie(config, "failed to load key file:");
-
 	if (!(bindtls = tls_server()))
 		die("failed to create server context");
-
-	if ((tls_configure(bindtls, config)) < 0)
-		tdie(bindtls, "failed to configure server:");
-
-	tls_config_free(config);
+	reconfigure(bindtls);
 
 	bindfd = frontpath ? unixsocket(frontpath, bind) :
 		networksocket(fronthost, frontport, bind);
@@ -423,6 +434,15 @@ main(int argc, char **argv)
 		die("cannot listen on socket:");
 
 	while (!interrupted) {
+		if (reconfplease) {
+			fprintf(stderr, "Received interrupt. Reconfiguring.\n");
+			tls_reset(bindtls);
+			reconfigure(bindtls);
+			reconfplease = 0;
+		}
+		/* If a signal occurs right before poll(), it will have to
+		 * wait until the next I/O takes place. This is a bug, but
+		 * fixing it might not be worth the effort. */
 		status = poll(pfds, 1+numconns, -1);
 		if (!status) continue;
 		if (status < 0) {
@@ -453,7 +473,7 @@ main(int argc, char **argv)
 		}
 	}
 
-	fprintf(stderr, "Received interrupt. Exiting ...\n");
+	fprintf(stderr, "Received interrupt. Exiting.\n");
 
 	while (numconns) {
 		delconn(numconns-1);
