@@ -17,26 +17,20 @@
 #include "config.h"
 #include "arg.h"
 
-/* get lvalue of the pollfd for the server of the connection with index id */
-#define SVPFD(id) (pfds[2*(id)+1])
-/* get lvalue of the pollfd for the client of the connection with index id */
-#define CLPFD(id) (pfds[2*(id)+2])
 
 typedef int (*attach_func)(int, const struct sockaddr *, socklen_t);
 
-struct buffer {
-	size_t length;
-	char  *data;
-	int    fin;
-	int    finack;
-};
+#define OK    0x0
+#define FIN   0x1
+#define RESET 0x2
 
 struct conn {
-	struct buffer sv2cl;
-	struct buffer cl2sv;
 	struct tls *tls;
-	int clinevt;
-	int cloutevt;
+	char *data; /* to be sent over this connection */
+	size_t length; /* of data */
+	int fin;
+	int inevent;
+	int outevent;
 };
 
 char *argv0;
@@ -55,16 +49,17 @@ char *frontport;
 
 struct conn   *conns;
 struct pollfd *pfds;
-size_t         numconns;
-size_t         capconns;
+int            numconns;
+int            capconns;
 
 volatile int interrupted;
 
 static int
 moreconns(void)
 {
+	/* TODO overflow checks */
 	void *mem;
-	size_t newcap = capconns ? 2 * capconns : 16;
+	int newcap = capconns ? 2 * capconns : 16;
 	
 	/* TODO reallocarray() */
 	mem = realloc(conns, newcap * sizeof *conns);
@@ -86,16 +81,16 @@ moreconns(void)
 }
 
 static int
-addconn(size_t *idptr)
+addconn(void)
 {
-	size_t id;
 	void *mem;
+	int id;
 
 	if (numconns + 1 > capconns) {
 		if (moreconns() < 0) return -1;
 	}
 
-	if (!(mem = malloc(2 * BUFSIZ))) {
+	if (!(mem = malloc(BUFSIZ))) {
 		warn("insufficient memory");
 		return -1;
 	}
@@ -103,36 +98,30 @@ addconn(size_t *idptr)
 	id = numconns++;
 
 	memset(&conns[id], 0, sizeof *conns);
-	conns[id].sv2cl.data = mem;
-	conns[id].cl2sv.data = (char *)mem + BUFSIZ;
-	conns[id].clinevt = POLLIN;
-	conns[id].cloutevt = POLLOUT;
+	conns[id].data = mem;
+	conns[id].inevent = POLLIN;
+	conns[id].outevent = POLLOUT;
 
-	SVPFD(id).fd = -1;
-	SVPFD(id).events = POLLIN;
-	CLPFD(id).fd = -1;
-	CLPFD(id).events = POLLIN;
+	pfds[1+id].fd = -1;
+	pfds[1+id].events = POLLIN;
+	pfds[1+id].revents = 0;
 
-	*idptr = id;
-	return 0;
+	return id;
 }
 
 static void
 delconn(size_t id)
 {
-	/* sv2cl & cl2sv are allocated as one block, so only free() the first one! */
-	free(conns[id].sv2cl.data);
+	free(conns[id].data);
 	if (conns[id].tls) {
 		tls_close(conns[id].tls);
 		tls_free(conns[id].tls);
 	}
-	if (SVPFD(id).fd >= 0) close(SVPFD(id).fd);
-	if (CLPFD(id).fd >= 0) close(CLPFD(id).fd);
+	if (pfds[1+id].fd >= 0) close(pfds[1+id].fd);
 
 	--numconns;
 	conns[id] = conns[numconns];
-	SVPFD(id) = SVPFD(numconns);
-	CLPFD(id) = CLPFD(numconns);
+	pfds[1+id] = pfds[1+numconns];
 }
 
 static int
@@ -181,197 +170,159 @@ unixsocket(const char *path, attach_func attach)
 }
 
 static int
-establishconn(int bindfd, struct tls *bindtls)
+establishlink(int bindfd, struct tls *bindtls)
 {
 	struct sockaddr_storage client_sa = { 0 };
 	socklen_t client_sa_len = 0;
-	size_t id;
+	int clid, svid;
 
-	if (addconn(&id) < 0) return -1;
+	if ((clid = addconn()) < 0) goto fail;
+	if ((svid = addconn()) < 0) goto fail;
 
-	CLPFD(id).fd = accept(bindfd,
+	pfds[1+clid].fd = accept(bindfd,
 		(struct sockaddr *)&client_sa,
 		&client_sa_len);
-	if (CLPFD(id).fd < 0) goto fail;
+	if (pfds[1+clid].fd < 0) goto fail;
 
-	if (tls_accept_socket(bindtls, &conns[id].tls, CLPFD(id).fd) < 0) {
+	if (tls_accept_socket(bindtls, &conns[clid].tls, pfds[1+clid].fd) < 0) {
 		warn("tls_accept_socket(): %s", tls_error(bindtls));
 		goto fail;
 	}
 
-	SVPFD(id).fd = backpath ? unixsocket(backpath, connect) :
+	pfds[1+svid].fd = backpath ? unixsocket(backpath, connect) :
 		networksocket(backhost, backport, connect);
-	if (SVPFD(id).fd < 0) goto fail;
+	if (pfds[1+svid].fd < 0) goto fail;
 
 	return 0;
 
 fail:
-	delconn(id);
+	/* needs to be inverse order of creation :/ */
+	if (svid >= 0) delconn(svid);
+	if (clid >= 0) delconn(clid);
 	return -1;
 }
 
 static int
-clin(struct conn *conn)
+readtls(int id, char *out, size_t *outlen)
 {
-	if (BUFSIZ - conn->cl2sv.length <= 0) {
-		fprintf(stderr, "Uh oh, attempted zero-length TLS read\n");
-		return 0;
-	}
-	ssize_t ret = tls_read(conn->tls,
-		conn->cl2sv.data + conn->cl2sv.length,
-		BUFSIZ - conn->cl2sv.length);
+	ssize_t ret = tls_read(conns[id].tls,
+		out + *outlen, BUFSIZ - *outlen);
 	switch (ret) {
 	case -1:
-		warn("tls_read(): %s", tls_error(conn->tls));
-		return -1;
+		warn("tls_read(): %s", tls_error(conns[id].tls));
+		return RESET;
 	case TLS_WANT_POLLIN:
-		conn->clinevt = POLLIN;
-		return 0;
+		conns[id].inevent = POLLIN;
+		return OK;
 	case TLS_WANT_POLLOUT:
-		conn->clinevt = POLLOUT;
-		return 0;
+		conns[id].inevent = POLLOUT;
+		return OK;
 	case 0:
-		conn->cl2sv.fin = 1;
-		return 0;
+		return FIN;
 	default:
-		conn->cl2sv.length += ret;
-		conn->clinevt = POLLIN;
-		return 0;
+		*outlen += ret;
+		conns[id].inevent = POLLIN;
+		return OK;
 	}
 }
 
 static int
-clout(struct conn *conn)
+writetls(int id)
 {
-	if (conn->sv2cl.length <= 0) {
-		fprintf(stderr, "Uh oh, attempted zero-length TLS write\n");
-		return 0;
-	}
-	ssize_t ret = tls_write(conn->tls, conn->sv2cl.data, conn->sv2cl.length);
+	ssize_t ret = tls_write(conns[id].tls,
+		conns[id].data, conns[id].length);
 	switch (ret) {
 	case -1:
-		warn("tls_write(): %s", tls_error(conn->tls));
-		return -1;
+		warn("tls_write(): %s", tls_error(conns[id].tls));
+		return RESET;
 	case TLS_WANT_POLLIN:
-		conn->cloutevt = POLLIN;
-		return 0;
+		conns[id].outevent = POLLIN;
+		return OK;
 	case TLS_WANT_POLLOUT:
-		conn->cloutevt = POLLOUT;
-		return 0;
+		conns[id].outevent = POLLOUT;
+		return OK;
 	case 0:
-		conn->cl2sv.fin = 1;
-		return 0;
+		return FIN;
 	default:
-		conn->sv2cl.length -= ret;
-		memmove(conn->sv2cl.data, conn->sv2cl.data + ret,
-			conn->sv2cl.length);
-		conn->cloutevt = POLLOUT;
-		return 0;
+		conns[id].length -= ret;
+		memmove(conns[id].data, conns[id].data + ret,
+			conns[id].length);
+		conns[id].outevent = POLLOUT;
+		return OK;
 	}
 }
 
 static int
-svin(struct conn *conn, int fd)
+readraw(int id, char *out, size_t *outlen)
 {
-	if (BUFSIZ - conn->sv2cl.length <= 0) {
-		fprintf(stderr, "Uh oh, attempted zero-length FD read\n");
-		return 0;
-	}
 	for (;;) {
-		ssize_t ret = read(fd,
-			conn->sv2cl.data + conn->sv2cl.length,
-			BUFSIZ - conn->sv2cl.length);
+		ssize_t ret = read(pfds[1+id].fd,
+			out + *outlen, BUFSIZ - *outlen);
 		if (ret > 0) {
-			conn->sv2cl.length += ret;
-			return 0;
+			*outlen += ret;
+			return OK;
 		}
-		if (!ret) {
-			conn->sv2cl.fin = 1;
-			return 0;
-		}
-		if (errno != EINTR) {
-			if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
+		if (!ret) return FIN;
+		if (errno == EINTR) {
+			if (errno == EAGAIN || errno == EWOULDBLOCK) return OK;
 			warn("read():");
-			return -1;
+			return RESET;
 		}
 	}
 }
 
 static int
-svout(struct conn *conn, int fd)
+writeraw(int id)
 {
-	if (conn->cl2sv.length <= 0) {
-		fprintf(stderr, "Uh oh, attempted zero-length FD write\n");
-		return 0;
-	}
 	for (;;) {
-		ssize_t ret = write(fd,
-			conn->cl2sv.data,
-			conn->cl2sv.length);
+		ssize_t ret = write(pfds[1+id].fd,
+			conns[id].data,
+			conns[id].length);
 		if (ret > 0) {
-			conn->cl2sv.length -= ret;
-			memmove(conn->cl2sv.data, conn->cl2sv.data + ret,
-				conn->cl2sv.length);
-			return 0;
+			conns[id].length -= ret;
+			memmove(conns[id].data, conns[id].data + ret,
+				conns[id].length);
+			return OK;
 		}
 		if (errno != EINTR) {
-			if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
+			if (errno == EAGAIN || errno == EWOULDBLOCK) return OK;
 			warn("write():");
-			return -1;
+			return RESET;
 		}
 	}
 }
 
 static int
-serve(size_t id)
+serve(int id, char *out, size_t *outlen)
 {
-	struct conn *conn = &conns[id];
-	struct pollfd *clp = &CLPFD(id), *svp = &SVPFD(id);
+	int revents = pfds[1+id].revents;
+	int status = OK;
 
-	if ((clp->revents | svp->revents) & POLLNVAL)
-		return -1;
+	if (revents & POLLNVAL) return RESET;
 
-	if (clp->revents & conn->clinevt) {
-		if (clin(conn) < 0) return -1;
-	}
-	if (svp->revents & POLLIN) {
-		if (svin(conn, svp->fd) < 0) return -1;
-	}
-	if (clp->revents & conn->cloutevt) {
-		if (clout(conn) < 0) return -1;
-	}
-	if (svp->revents & POLLOUT) {
-		if (svout(conn, svp->fd) < 0) return -1;
+	if (!conns[id].fin && (revents & POLLIN) && *outlen < BUFSIZ) {
+		status |= (conns[id].tls ? readtls : readraw)(id, out, outlen);
+		if (status & FIN) conns[id].fin = 1;
+		if (status & RESET) return status;
 	}
 
-	if ((clp->revents | svp->revents) & POLLHUP)
-		if (!conn->sv2cl.length && !conn->cl2sv.length)
-			return -1;
-	if ((clp->revents | svp->revents) & POLLERR)
-		return -1;
-
-	if (conn->cl2sv.fin && !conn->cl2sv.length) {
-		shutdown(SVPFD(id).fd, SHUT_WR);
-		conn->cl2sv.fin = 0;
-		conn->cl2sv.finack = 1;
+	if ((revents & POLLOUT) && conns[id].length > 0) {
+		status |= (conns[id].tls ? writetls : writeraw)(id);
+		if (status & RESET) return status;
 	}
-	if (conn->sv2cl.fin && !conn->sv2cl.length) {
-		shutdown(CLPFD(id).fd, SHUT_WR);
-		conn->cl2sv.fin = 0;
-		conn->cl2sv.finack = 1;
-	}
-	if (conn->sv2cl.finack && conn->cl2sv.finack) return -1;
 
-	svp->events = (conn->sv2cl.length < BUFSIZ/2 ? POLLIN : 0) |
-		(conn->cl2sv.length > 0 ? POLLOUT : 0);
-	clp->events = (conn->sv2cl.length > 0 ? conn->cloutevt : 0) |
-		(conn->cl2sv.length < BUFSIZ/2 ? conn->clinevt : 0);
-
-	return 0;
+	return status;
 }
 
 static void
-handle_signal(int signal)
+chooseevents(int id, size_t outlen)
+{
+	pfds[1+id].events = (outlen < BUFSIZ/2 ? conns[id].inevent : 0) |
+		(conns[id].length > 0 ? conns[id].outevent : 0);
+}
+
+static void
+handlesignal(int signal)
 {
 	switch (signal) {
 	case SIGINT:
@@ -395,9 +346,10 @@ main(int argc, char **argv)
 	int bindfd = 0;
 	struct tls_config *config;
 	struct tls *bindtls;
-	int status;
+	int status, cmd;
+	int id;
 
-	action.sa_handler = handle_signal;
+	action.sa_handler = handlesignal;
 	sigaction(SIGINT, &action, NULL);
 	action.sa_handler = SIG_IGN;
 	sigaction(SIGPIPE, &action, NULL);
@@ -471,7 +423,7 @@ main(int argc, char **argv)
 		die("cannot listen on socket:");
 
 	while (!interrupted) {
-		status = poll(pfds, 1+2*numconns, -1);
+		status = poll(pfds, 1+numconns, -1);
 		if (!status) continue;
 		if (status < 0) {
 			if (errno == EINTR) continue;
@@ -481,28 +433,30 @@ main(int argc, char **argv)
 
 		if (pfds[0].revents) {
 			status--;
-			establishconn(bindfd, bindtls);
+			establishlink(bindfd, bindtls);
 		}
 
-		size_t id;
-		for (id = 0; status; id++) {
-			int active = 0;
-			if (SVPFD(id).revents) status--, active = 1;
-			if (CLPFD(id).revents) status--, active = 1;
-			if (active) {
-				if (serve(id) < 0) {
-					delconn(id);
-					id--;
-				}
+		for (id = 0; id < numconns && status; id++) {
+			if (!pfds[1+id].revents) continue;
+			status--;
+			cmd = serve(id, conns[id^1].data, &conns[id^1].length);
+			chooseevents(id, conns[id^1].length);
+			chooseevents(id^1, conns[id].length);
+			if (cmd & FIN) {
+				shutdown(pfds[1+(id^1)].fd, SHUT_WR);
+			}
+			if (cmd & RESET) {
+				delconn(id|1);
+				delconn(id&~1);
+				id -= 2;
 			}
 		}
 	}
 
 	fprintf(stderr, "Received interrupt. Exiting ...\n");
 
-	size_t id;
-	for (id = 0; id < numconns; id++) {
-		delconn(id);
+	while (numconns) {
+		delconn(numconns-1);
 	}
 	free(conns);
 	free(pfds);
